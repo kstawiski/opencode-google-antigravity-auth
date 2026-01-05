@@ -8,6 +8,21 @@ const log = createLogger("storage");
 export type ModelFamily = "claude" | "gemini-flash" | "gemini-pro";
 export type AccountTier = "free" | "paid";
 
+const ACCOUNTS_CACHE_TTL_MS = (() => {
+  const raw = process.env.ANTIGRAVITY_ACCOUNTS_CACHE_TTL_MS;
+  if (!raw) return 1000;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : 1000;
+})();
+
+let accountsCache: { value: AccountStorage | null; loadedAt: number } | null = null;
+let accountsLoadPending: Promise<AccountStorage | null> | null = null;
+
+export function resetAccountsCache(): void {
+  accountsCache = null;
+  accountsLoadPending = null;
+}
+
 export interface RateLimitState {
   claude?: number;
   "gemini-flash"?: number;
@@ -146,50 +161,70 @@ function migrateV2ToV3(v2: AccountStorageV2): AccountStorage {
 }
 
 export async function loadAccounts(): Promise<AccountStorage | null> {
-  try {
-    const path = getStoragePath();
-    const content = await fs.readFile(path, "utf-8");
-    const data = JSON.parse(content) as AnyAccountStorage;
-
-    if (!Array.isArray(data.accounts)) {
-      log.warn("Invalid storage format, ignoring");
-      return null;
-    }
-
-    let storage: AccountStorage;
-
-    if (data.version === 1) {
-      log.info("Migrating account storage from v1 to v3");
-      const v2 = migrateV1ToV2(data);
-      storage = migrateV2ToV3(v2);
-      await saveAccounts(storage);
-    } else if (data.version === 2) {
-      log.info("Migrating account storage from v2 to v3");
-      storage = migrateV2ToV3(data);
-      await saveAccounts(storage);
-    } else if (data.version === 3) {
-      storage = data;
-    } else {
-      log.warn("Unknown storage version, ignoring", { version: (data as { version?: unknown }).version });
-      return null;
-    }
-
-    if (typeof storage.activeIndex !== "number" || !Number.isInteger(storage.activeIndex)) {
-      storage.activeIndex = 0;
-    }
-
-    if (storage.activeIndex < 0 || storage.activeIndex >= storage.accounts.length) {
-      storage.activeIndex = 0;
-    }
-
-    return storage;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      return null;
-    }
-    log.error("Failed to load account storage", { error: String(error) });
-    return null;
+  if (accountsCache && Date.now() - accountsCache.loadedAt < ACCOUNTS_CACHE_TTL_MS) {
+    return accountsCache.value;
   }
+
+  if (accountsLoadPending) {
+    return accountsLoadPending;
+  }
+
+  const loadPromise = (async (): Promise<AccountStorage | null> => {
+    try {
+      const path = getStoragePath();
+      const content = await fs.readFile(path, "utf-8");
+      const data = JSON.parse(content) as AnyAccountStorage;
+
+      if (!Array.isArray((data as { accounts?: unknown }).accounts)) {
+        log.warn("Invalid storage format, ignoring");
+        accountsCache = { value: null, loadedAt: Date.now() };
+        return null;
+      }
+
+      let storage: AccountStorage;
+
+      if ((data as { version?: unknown }).version === 1) {
+        log.info("Migrating account storage from v1 to v3");
+        const v2 = migrateV1ToV2(data as AccountStorageV1);
+        storage = migrateV2ToV3(v2);
+        await saveAccounts(storage);
+      } else if ((data as { version?: unknown }).version === 2) {
+        log.info("Migrating account storage from v2 to v3");
+        storage = migrateV2ToV3(data as AccountStorageV2);
+        await saveAccounts(storage);
+      } else if ((data as { version?: unknown }).version === 3) {
+        storage = data as AccountStorage;
+      } else {
+        log.warn("Unknown storage version, ignoring", { version: (data as { version?: unknown }).version });
+        accountsCache = { value: null, loadedAt: Date.now() };
+        return null;
+      }
+
+      if (typeof storage.activeIndex !== "number" || !Number.isInteger(storage.activeIndex)) {
+        storage.activeIndex = 0;
+      }
+
+      if (storage.activeIndex < 0 || storage.activeIndex >= storage.accounts.length) {
+        storage.activeIndex = 0;
+      }
+
+      accountsCache = { value: storage, loadedAt: Date.now() };
+      return storage;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        accountsCache = { value: null, loadedAt: Date.now() };
+        return null;
+      }
+      log.error("Failed to load account storage", { error: String(error) });
+      accountsCache = { value: null, loadedAt: Date.now() };
+      return null;
+    } finally {
+      accountsLoadPending = null;
+    }
+  })();
+
+  accountsLoadPending = loadPromise;
+  return loadPromise;
 }
 
 export async function saveAccounts(storage: AccountStorage): Promise<void> {
@@ -200,6 +235,8 @@ export async function saveAccounts(storage: AccountStorage): Promise<void> {
 
     const content = JSON.stringify(storage, null, 2);
     await fs.writeFile(path, content, "utf-8");
+
+    accountsCache = { value: storage, loadedAt: Date.now() };
   } catch (error) {
     log.error("Failed to save account storage", { error: String(error) });
     throw error;

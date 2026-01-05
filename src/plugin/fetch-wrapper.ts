@@ -15,6 +15,9 @@ const log = createLogger("fetch-wrapper");
 const RATE_LIMIT_BACKOFF_BASE_MS = 1000;
 const RATE_LIMIT_BACKOFF_MAX_MS = 60 * 60 * 1000;
 const RATE_LIMIT_SERVER_RETRY_MAX_MS = 24 * 60 * 60 * 1000;
+const RETRY_JITTER_FACTOR = 0.2;
+const RETRY_MIN_DELAY_MS = 2000;
+const RETRY_JITTER_CAP_MS = 60 * 1000;
 
 interface RateLimitDelay {
   attempt: number;
@@ -30,6 +33,24 @@ export function computeExponentialBackoffMs(
   const safeAttempt = Math.max(1, Math.floor(attempt));
   const multiplier = 2 ** (safeAttempt - 1);
   return Math.min(maxMs, Math.max(0, Math.floor(baseMs * multiplier)));
+}
+
+function applyJitterPlusMinus(ms: number, factor: number = RETRY_JITTER_FACTOR): number {
+  const safeMs = Math.max(0, Math.floor(ms));
+  if (safeMs === 0) return 0;
+  const range = Math.floor(safeMs * factor);
+  if (range <= 0) return safeMs;
+  const jitter = Math.floor((Math.random() * (range * 2 + 1)) - range);
+  return Math.max(1, safeMs + jitter);
+}
+
+function applyJitterPositive(ms: number, factor: number = RETRY_JITTER_FACTOR): number {
+  const safeMs = Math.max(0, Math.floor(ms));
+  if (safeMs === 0) return 0;
+  const maxExtra = Math.floor(safeMs * factor);
+  if (maxExtra <= 0) return safeMs;
+  const extra = Math.floor(Math.random() * (maxExtra + 1));
+  return Math.max(1, safeMs + extra);
 }
 
 function toUrlStr(value: RequestInfo | URL): string {
@@ -199,9 +220,12 @@ function formatWaitTimeMs(ms: number): string {
   return `${seconds}s`;
 }
 
+type RateLimitReason = "QUOTA_EXHAUSTED" | "RATE_LIMIT_EXCEEDED" | "UNKNOWN";
+
 type RateLimitBodyInfo = {
   retryDelayMs: number | null;
   message?: string;
+  reason?: RateLimitReason;
 };
 
 function extractRateLimitBodyInfo(body: unknown): RateLimitBodyInfo {
@@ -218,6 +242,16 @@ function extractRateLimitBodyInfo(body: unknown): RateLimitBodyInfo {
 
   const details = (error as { details?: unknown }).details;
   if (Array.isArray(details)) {
+    let parsedReason: RateLimitReason | undefined;
+    for (const detail of details) {
+      if (!detail || typeof detail !== "object") continue;
+      const reason = (detail as { reason?: unknown }).reason;
+      if (typeof reason === "string") {
+        if (reason === "QUOTA_EXHAUSTED") parsedReason = "QUOTA_EXHAUSTED";
+        if (reason === "RATE_LIMIT_EXCEEDED") parsedReason = "RATE_LIMIT_EXCEEDED";
+      }
+    }
+
     for (const detail of details) {
       if (!detail || typeof detail !== "object") continue;
       const type = (detail as { "@type"?: unknown })["@type"];
@@ -226,7 +260,7 @@ function extractRateLimitBodyInfo(body: unknown): RateLimitBodyInfo {
         if (typeof retryDelay === "string") {
           const retryDelayMs = parseDurationLikeToMs(retryDelay);
           if (retryDelayMs !== null) {
-            return { retryDelayMs, message };
+            return { retryDelayMs, message, reason: parsedReason };
           }
         }
       }
@@ -240,7 +274,7 @@ function extractRateLimitBodyInfo(body: unknown): RateLimitBodyInfo {
       if (typeof quotaResetDelay === "string") {
         const quotaResetDelayMs = parseDurationLikeToMs(quotaResetDelay);
         if (quotaResetDelayMs !== null) {
-          return { retryDelayMs: quotaResetDelayMs, message };
+          return { retryDelayMs: quotaResetDelayMs, message, reason: parsedReason };
         }
       }
     }
@@ -317,6 +351,17 @@ interface EndpointLoopResult {
   attemptInfo?: AttemptInfo;
 }
 
+function getDefaultRetryAfterMs(reason?: RateLimitReason): number {
+  switch (reason) {
+    case "QUOTA_EXHAUSTED":
+      return 60 * 60 * 1000;
+    case "RATE_LIMIT_EXCEEDED":
+      return 30 * 1000;
+    default:
+      return 60 * 1000;
+  }
+}
+
 async function handleRateLimit(
   response: Response,
   account: ReturnType<AccountManager["getCurrentOrNextForFamily"]> & {},
@@ -333,13 +378,20 @@ async function handleRateLimit(
   const retryAfterHeaderMs = parseRetryAfterMs(response);
   const bodyInfo = await extractRetryAfterFromBodyMs(response);
   const retryAfterBodyMs = bodyInfo.retryDelayMs;
-  const serverRetryAfterMs = retryAfterBodyMs ?? retryAfterHeaderMs;
+  const explicitServerRetryAfterMs = retryAfterBodyMs ?? retryAfterHeaderMs;
+  const fallbackRetryAfterMs =
+    explicitServerRetryAfterMs ?? Math.min(getDefaultRetryAfterMs(bodyInfo.reason), RATE_LIMIT_SERVER_RETRY_MAX_MS);
+  const serverRetryAfterMs = fallbackRetryAfterMs;
 
   const { attempt, delayMs, serverRetryAfterMs: appliedServerRetryMs } = getRateLimitDelay(account.index, serverRetryAfterMs);
-  const retryAfterMs = delayMs;
-  const waitTimeSec = Math.max(1, Math.ceil(retryAfterMs / 1000));
+  let retryAfterMs = Math.max(delayMs, RETRY_MIN_DELAY_MS);
 
-  const retrySource = retryAfterBodyMs !== null ? "body" : retryAfterHeaderMs !== null ? "header" : "backoff";
+  const retrySource =
+    retryAfterBodyMs !== null ? "body" : retryAfterHeaderMs !== null ? "header" : explicitServerRetryAfterMs === null ? "default" : "backoff";
+
+  if (retryAfterMs <= RETRY_JITTER_CAP_MS) {
+    retryAfterMs = applyJitterPositive(retryAfterMs);
+  }
 
   printAntigravityConsole(
     "error",
@@ -460,43 +512,40 @@ async function handleRateLimit(
 async function handleServerError(
   response: Response,
   account: ReturnType<AccountManager["getCurrentOrNextForFamily"]> & {},
-  accountManager: AccountManager,
   accountCount: number,
   client: PluginContext["client"],
+  abortSignal: AbortSignal | undefined,
+  getServerErrorDelay: (family: ModelFamily, status: number) => { attempt: number; delayMs: number },
   family: ModelFamily,
 ): Promise<EndpointLoopResult> {
-  const retryAfterMs = 60000;
+  const { attempt, delayMs } = getServerErrorDelay(family, response.status);
+  let retryAfterMs = Math.max(delayMs, 1000);
+  if (retryAfterMs <= RETRY_JITTER_CAP_MS) {
+    retryAfterMs = applyJitterPlusMinus(retryAfterMs);
+  }
 
-  // For 500 errors, we use a fixed short retry (1 min) rather than the heavy defaults
-  accountManager.markRateLimited(account, retryAfterMs, family);
-
-  log.warn(`Account ${account.index + 1}/${accountCount} received ${response.status} error on all endpoints`, {
+  log.warn(`Received ${response.status} server error on all endpoints; backing off`, {
     fromAccountIndex: account.index,
     fromAccountEmail: account.email,
     accountCount,
     status: response.status,
+    attempt,
     retryAfterMs,
     reason: "server-error",
+    family,
   });
 
-  if (accountCount > 1) {
+  try {
     await client.tui.showToast({
       body: {
-        message: `Server error on ${account.email || `Account ${account.index + 1}`}. Switching...`,
+        message: `Antigravity server error (${response.status}). Retrying in ${formatWaitTimeMs(retryAfterMs)} (attempt ${attempt})...`,
         variant: "warning",
       },
     });
-  }
+  } catch {}
 
-  try {
-    await accountManager.save();
-  } catch (error) {
-    log.warn("Failed to save rate limit state", {
-      error: error instanceof Error ? error.message : String(error),
-    });
-  }
-
-  return { type: "rate-limit", retryAfterMs };
+  await sleep(retryAfterMs, abortSignal);
+  return { type: "retry-soon" };
 }
 
 async function tryEndpointFallbacks(
@@ -510,6 +559,7 @@ async function tryEndpointFallbacks(
   client: PluginContext["client"],
   abortSignal: AbortSignal | undefined,
   getRateLimitDelay: (accountIndex: number, serverRetryAfterMs: number | null) => RateLimitDelay,
+  getServerErrorDelay: (family: ModelFamily, status: number) => { attempt: number; delayMs: number },
   family: ModelFamily,
 ): Promise<EndpointLoopResult> {
   let lastError: Error | null = null;
@@ -573,7 +623,7 @@ async function tryEndpointFallbacks(
       }
 
       if (response.status >= 500 && i === CODE_ASSIST_ENDPOINT_FALLBACKS.length - 1) {
-        return handleServerError(response, account, accountManager, accountCount, client, family);
+        return handleServerError(response, account, accountCount, client, abortSignal, getServerErrorDelay, family);
       }
 
       const shouldRetryEndpoint = response.status === 403 || response.status === 404 || response.status >= 500;
@@ -605,6 +655,7 @@ export function createAntigravityFetch(
   client: PluginContext["client"],
 ): (input: RequestInfo | URL, init?: RequestInit) => Promise<Response> {
   const rateLimitStateByAccount = new Map<number, { consecutive429: number; lastAt: number }>();
+  const serverErrorStateByFamily = new Map<ModelFamily, { consecutive: number; lastAt: number }>();
 
   const getRateLimitDelay = (accountIndex: number, serverRetryAfterMs: number | null): RateLimitDelay => {
     const now = Date.now();
@@ -620,6 +671,20 @@ export function createAntigravityFetch(
 
   const resetRateLimitState = (accountIndex: number): void => {
     rateLimitStateByAccount.delete(accountIndex);
+  };
+
+  const getServerErrorDelay = (family: ModelFamily, status: number): { attempt: number; delayMs: number } => {
+    const now = Date.now();
+    const previous = serverErrorStateByFamily.get(family);
+    const attempt = (previous?.consecutive ?? 0) + 1;
+    const maxMs = status === 503 || status === 529 ? 8000 : 20000;
+    const delayMs = computeExponentialBackoffMs(attempt, 1000, maxMs);
+    serverErrorStateByFamily.set(family, { consecutive: attempt, lastAt: now });
+    return { attempt, delayMs };
+  };
+
+  const resetServerErrorState = (family: ModelFamily): void => {
+    serverErrorStateByFamily.delete(family);
   };
 
   return async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
@@ -641,8 +706,34 @@ export function createAntigravityFetch(
     const accountManager = new AccountManager(latestAuth, storedAccounts);
     const accountCount = accountManager.getAccountCount();
 
+    const persistAccountState = async (): Promise<void> => {
+      if (accountManager.isAuthDirty()) {
+        try {
+          await client.auth.set({
+            path: { id: ANTIGRAVITY_PROVIDER_ID },
+            body: accountManager.toAuthDetails(),
+          });
+          accountManager.markAuthSaved();
+        } catch (error) {
+          log.warn("Failed to persist updated auth details", {
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+
+      if (accountManager.isStorageDirty()) {
+        try {
+          await accountManager.save();
+        } catch (error) {
+          log.warn("Failed to persist account metadata", {
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+    };
+
     const resolveProjectContext = async (authRecord: typeof latestAuth): Promise<ProjectContextResult> => {
-      return ensureProjectContext(authRecord, client);
+      return ensureProjectContext(authRecord);
     };
 
     const abortSignal = init?.signal ?? undefined;
@@ -701,13 +792,7 @@ export function createAntigravityFetch(
           },
         );
 
-        try {
-          await accountManager.save();
-        } catch (error) {
-          log.warn("Failed to save account switch state", {
-            error: error instanceof Error ? error.message : String(error),
-          });
-        }
+        await persistAccountState();
       }
 
       let authRecord = accountManager.accountToAuth(account);
@@ -719,19 +804,18 @@ export function createAntigravityFetch(
         const parts = parseRefreshParts(refreshed.refresh);
         accountManager.updateAccount(account, refreshed.access!, refreshed.expires!, parts);
 
-        try {
-          await accountManager.save();
-        } catch (error) {
-          log.warn("Failed to save account state after token refresh", {
-            error: error instanceof Error ? error.message : String(error),
-          });
-        }
+        await persistAccountState();
       }
 
       const accessToken = authRecord.access;
       if (!accessToken) continue;
 
       const projectContext = await resolveProjectContext(authRecord);
+      if (projectContext.auth.refresh !== authRecord.refresh) {
+        const parts = parseRefreshParts(projectContext.auth.refresh);
+        accountManager.updateAccount(account, authRecord.access, authRecord.expires, parts);
+        await persistAccountState();
+      }
 
       const result = await tryEndpointFallbacks(
         input,
@@ -744,6 +828,7 @@ export function createAntigravityFetch(
         client,
         abortSignal,
         getRateLimitDelay,
+        getServerErrorDelay,
         family,
       );
 
@@ -762,21 +847,9 @@ export function createAntigravityFetch(
 
       if (result.type === "success" && result.response) {
         resetRateLimitState(account.index);
+        resetServerErrorState(family);
 
-        try {
-          await client.auth.set({
-            path: { id: ANTIGRAVITY_PROVIDER_ID },
-            body: accountManager.toAuthDetails(),
-          });
-          await accountManager.save();
-        } catch (saveError) {
-          log.error("Failed to save updated auth", {
-            error: saveError instanceof Error ? saveError.message : String(saveError),
-          });
-          await client.tui.showToast({
-            body: { message: "Failed to save updated auth", variant: "error" },
-          });
-        }
+        await persistAccountState();
 
         const { streaming, requestedModel } = result.attemptInfo ?? { streaming: false, requestedModel: undefined };
         const debugContext = startAntigravityDebugRequest({

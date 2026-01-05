@@ -1,5 +1,4 @@
 import {
-  ANTIGRAVITY_PROVIDER_ID,
   CODE_ASSIST_ENDPOINT,
   CODE_ASSIST_HEADERS,
 } from "../constants";
@@ -7,7 +6,6 @@ import { formatRefreshParts, parseRefreshParts } from "./auth";
 import { printAntigravityConsole } from "./logger";
 import type {
   OAuthAuthDetails,
-  PluginClient,
   ProjectContextResult,
 } from "./types";
 
@@ -220,7 +218,6 @@ export async function onboardManagedProject(
  */
 export async function ensureProjectContext(
   auth: OAuthAuthDetails,
-  client: PluginClient,
 ): Promise<ProjectContextResult> {
   const accessToken = auth.access;
   if (!accessToken) {
@@ -260,11 +257,6 @@ export async function ensureProjectContext(
         }),
       };
 
-      await client.auth.set({
-        path: { id: ANTIGRAVITY_PROVIDER_ID },
-        body: updatedAuth,
-      });
-
       return { auth: updatedAuth, effectiveProjectId: managedProjectId };
     }
 
@@ -294,11 +286,6 @@ export async function ensureProjectContext(
           managedProjectId,
         }),
       };
-
-      await client.auth.set({
-        path: { id: ANTIGRAVITY_PROVIDER_ID },
-        body: updatedAuth,
-      });
 
       return { auth: updatedAuth, effectiveProjectId: managedProjectId };
     }

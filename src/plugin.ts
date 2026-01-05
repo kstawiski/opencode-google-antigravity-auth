@@ -24,6 +24,24 @@ import type {
 
 const log = createLogger("plugin");
 
+async function persistAccountState(accountManager: AccountManager, client: PluginContext["client"]): Promise<void> {
+  if (accountManager.isAuthDirty()) {
+    try {
+      await client.auth.set({
+        path: { id: ANTIGRAVITY_PROVIDER_ID },
+        body: accountManager.toAuthDetails(),
+      });
+      accountManager.markAuthSaved();
+    } catch {}
+  }
+
+  if (accountManager.isStorageDirty()) {
+    try {
+      await accountManager.save();
+    } catch {}
+  }
+}
+
 async function getAuthContext(
   getAuth: GetAuth,
   client: PluginContext["client"],
@@ -35,9 +53,15 @@ async function getAuthContext(
 
   const storedAccounts = await loadAccounts();
   const accountManager = new AccountManager(auth, storedAccounts);
+  const previousAccount = accountManager.getCurrentAccount();
   const account = accountManager.getCurrentOrNextForFamily("gemini-flash");
   if (!account) {
     return null;
+  }
+
+  if (!previousAccount || previousAccount.index !== account.index) {
+    accountManager.markSwitched(account, previousAccount ? "rotation" : "initial");
+    await persistAccountState(accountManager, client);
   }
 
   let authRecord = accountManager.accountToAuth(account);
@@ -52,13 +76,7 @@ async function getAuthContext(
     const parts = parseRefreshParts(refreshed.refresh);
     accountManager.updateAccount(account, refreshed.access!, refreshed.expires!, parts);
 
-    try {
-      await client.auth.set({
-        path: { id: ANTIGRAVITY_PROVIDER_ID },
-        body: accountManager.toAuthDetails(),
-      });
-      await accountManager.save();
-    } catch {}
+    await persistAccountState(accountManager, client);
   }
 
   const accessToken = authRecord.access;
@@ -67,7 +85,14 @@ async function getAuthContext(
   }
 
   try {
-    const projectContext = await ensureProjectContext(authRecord, client);
+    const projectContext = await ensureProjectContext(authRecord);
+    authRecord = projectContext.auth;
+
+    if (projectContext.auth.refresh !== accountManager.accountToAuth(account).refresh) {
+      const parts = parseRefreshParts(projectContext.auth.refresh);
+      accountManager.updateAccount(account, authRecord.access, authRecord.expires, parts);
+      await persistAccountState(accountManager, client);
+    }
     return { accessToken, projectId: projectContext.effectiveProjectId };
   } catch {
     return null;

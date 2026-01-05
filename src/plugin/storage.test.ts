@@ -1,7 +1,7 @@
 import { describe, it, expect, mock, beforeEach } from "bun:test";
 import { join } from "node:path";
 import { promises as fs } from "node:fs";
-import { loadAccounts, saveAccounts, getStoragePath, type AccountStorageV1, type AccountStorageV2, type AccountStorage } from "./storage";
+import { loadAccounts, saveAccounts, getStoragePath, resetAccountsCache, type AccountStorageV1, type AccountStorageV2, type AccountStorage } from "./storage";
 
 // Mock filesystem
 const mockFs = {
@@ -27,6 +27,7 @@ mock.module("./logger", () => ({
 
 describe("storage migration", () => {
   beforeEach(() => {
+    resetAccountsCache();
     mockFs.readFile.mockReset();
     mockFs.writeFile.mockReset();
     mockFs.mkdir.mockReset();

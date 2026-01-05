@@ -15,6 +15,7 @@ export interface ManagedAccount {
   access?: string;
   expires?: number;
   rateLimitResetTimes: RateLimitState;
+  addedAt: number;
   lastUsed: number;
   email?: string;
   tier?: AccountTier;
@@ -46,6 +47,8 @@ export class AccountManager {
   private accounts: ManagedAccount[] = [];
   private currentIndex = 0;
   private currentAccountIndex = -1;
+  private storageDirty = false;
+  private authDirty = false;
 
   constructor(auth: OAuthAuthDetails, storedAccounts?: AccountStorage | null) {
     if (storedAccounts && storedAccounts.accounts.length > 0) {
@@ -69,6 +72,7 @@ export class AccountManager {
         access: index === activeIndex ? auth.access : undefined,
         expires: index === activeIndex ? auth.expires : undefined,
         rateLimitResetTimes: acc.rateLimitResetTimes ?? {},
+        addedAt: acc.addedAt,
         lastUsed: acc.lastUsed,
         email: acc.email,
         tier: acc.tier,
@@ -81,12 +85,14 @@ export class AccountManager {
       this.currentIndex = 0;
 
       if (multiAccount.accounts.length > 0) {
+        const now = Date.now();
         this.accounts = multiAccount.accounts.map((parts, index) => ({
           index,
           parts,
           access: index === 0 ? auth.access : undefined,
           expires: index === 0 ? auth.expires : undefined,
           rateLimitResetTimes: {},
+          addedAt: now,
           lastUsed: 0,
         }));
       } else {
@@ -96,6 +102,7 @@ export class AccountManager {
           access: auth.access,
           expires: auth.expires,
           rateLimitResetTimes: {},
+          addedAt: Date.now(),
           lastUsed: 0,
         });
       }
@@ -111,7 +118,7 @@ export class AccountManager {
         refreshToken: acc.parts.refreshToken,
         projectId: acc.parts.projectId,
         managedProjectId: acc.parts.managedProjectId,
-        addedAt: acc.lastUsed || Date.now(),
+        addedAt: acc.addedAt,
         lastUsed: acc.lastUsed,
         lastSwitchReason: acc.lastSwitchReason,
         rateLimitResetTimes: acc.rateLimitResetTimes,
@@ -120,6 +127,19 @@ export class AccountManager {
     };
 
     await saveAccounts(storage);
+    this.storageDirty = false;
+  }
+
+  isStorageDirty(): boolean {
+    return this.storageDirty;
+  }
+
+  isAuthDirty(): boolean {
+    return this.authDirty;
+  }
+
+  markAuthSaved(): void {
+    this.authDirty = false;
   }
 
   getCurrentAccount(): ManagedAccount | null {
@@ -132,6 +152,8 @@ export class AccountManager {
   markSwitched(account: ManagedAccount, reason: "rate-limit" | "initial" | "rotation"): void {
     account.lastSwitchReason = reason;
     this.currentAccountIndex = account.index;
+    this.storageDirty = true;
+    this.authDirty = true;
   }
 
   getAccountCount(): number {
@@ -185,13 +207,19 @@ export class AccountManager {
 
   markRateLimited(account: ManagedAccount, retryAfterMs: number, family: ModelFamily): void {
     account.rateLimitResetTimes[family] = Date.now() + retryAfterMs;
+    this.storageDirty = true;
   }
 
   updateAccount(account: ManagedAccount, access: string, expires: number, parts?: RefreshParts): void {
     account.access = access;
     account.expires = expires;
+    if (account.index === this.currentAccountIndex) {
+      this.authDirty = true;
+    }
+    this.storageDirty = true;
     if (parts) {
       account.parts = parts;
+      this.authDirty = true;
     }
   }
 
@@ -216,10 +244,13 @@ export class AccountManager {
       access,
       expires,
       rateLimitResetTimes: {},
+      addedAt: Date.now(),
       lastUsed: 0,
       email,
       tier,
     });
+    this.storageDirty = true;
+    this.authDirty = true;
   }
 
   removeAccount(index: number): boolean {
@@ -228,6 +259,11 @@ export class AccountManager {
     }
     this.accounts.splice(index, 1);
     this.accounts.forEach((acc, idx) => (acc.index = idx));
+    if (this.currentAccountIndex >= this.accounts.length) {
+      this.currentAccountIndex = this.accounts.length - 1;
+    }
+    this.storageDirty = true;
+    this.authDirty = true;
     return true;
   }
 
