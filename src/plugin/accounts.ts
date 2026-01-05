@@ -5,9 +5,9 @@ import {
   parseRefreshParts,
   formatRefreshParts,
 } from "./auth";
-import { saveAccounts, type AccountStorage, type RateLimitState, type ModelFamily, type AccountTier } from "./storage";
+import { saveAccounts, type AccountStorage, type RateLimitState, type ModelFamily, type AccountTier, type QuotaUsage, QUOTA_RESET_INTERVAL_MS } from "./storage";
 
-export type { ModelFamily, AccountTier } from "./storage";
+export type { ModelFamily, AccountTier, QuotaUsage } from "./storage";
 
 export interface ManagedAccount {
   index: number;
@@ -19,6 +19,12 @@ export interface ManagedAccount {
   email?: string;
   tier?: AccountTier;
   lastSwitchReason?: "rate-limit" | "initial" | "rotation";
+  /** Quota usage tracking for smart account recommendation */
+  quotaUsage: QuotaUsage;
+  /** Count of consecutive successful requests (resets on error) */
+  consecutiveSuccesses: number;
+  /** Count of total rate limits encountered */
+  totalRateLimits: number;
 }
 
 function isRateLimitedForFamily(account: ManagedAccount, family: ModelFamily): boolean {
@@ -73,6 +79,9 @@ export class AccountManager {
         email: acc.email,
         tier: acc.tier,
         lastSwitchReason: acc.lastSwitchReason,
+        quotaUsage: acc.quotaUsage ?? {},
+        consecutiveSuccesses: acc.consecutiveSuccesses ?? 0,
+        totalRateLimits: acc.totalRateLimits ?? 0,
       }));
     } else {
       const multiAccount = parseMultiAccountRefresh(auth.refresh);
@@ -88,6 +97,9 @@ export class AccountManager {
           expires: index === 0 ? auth.expires : undefined,
           rateLimitResetTimes: {},
           lastUsed: 0,
+          quotaUsage: {},
+          consecutiveSuccesses: 0,
+          totalRateLimits: 0,
         }));
       } else {
         this.accounts.push({
@@ -97,6 +109,9 @@ export class AccountManager {
           expires: auth.expires,
           rateLimitResetTimes: {},
           lastUsed: 0,
+          quotaUsage: {},
+          consecutiveSuccesses: 0,
+          totalRateLimits: 0,
         });
       }
     }
@@ -115,6 +130,9 @@ export class AccountManager {
         lastUsed: acc.lastUsed,
         lastSwitchReason: acc.lastSwitchReason,
         rateLimitResetTimes: acc.rateLimitResetTimes,
+        quotaUsage: acc.quotaUsage,
+        consecutiveSuccesses: acc.consecutiveSuccesses,
+        totalRateLimits: acc.totalRateLimits,
       })),
       activeIndex: Math.max(0, this.currentAccountIndex),
     };
@@ -219,6 +237,9 @@ export class AccountManager {
       lastUsed: 0,
       email,
       tier,
+      quotaUsage: {},
+      consecutiveSuccesses: 0,
+      totalRateLimits: 0,
     });
   }
 
@@ -259,5 +280,119 @@ export class AccountManager {
       .map((t) => Math.max(0, t - Date.now()));
 
     return waitTimes.length > 0 ? Math.min(...waitTimes) : 0;
+  }
+
+  /**
+   * Record a successful request for quota tracking.
+   * Resets quota counter if the reset interval has passed.
+   */
+  recordSuccess(account: ManagedAccount, family: ModelFamily): void {
+    const now = Date.now();
+    const usage = account.quotaUsage[family];
+
+    if (!usage || now - usage.lastReset >= QUOTA_RESET_INTERVAL_MS) {
+      // Reset quota window
+      account.quotaUsage[family] = { requests: 1, lastReset: now };
+    } else {
+      // Increment within current window
+      account.quotaUsage[family] = { requests: usage.requests + 1, lastReset: usage.lastReset };
+    }
+
+    account.consecutiveSuccesses++;
+    account.lastUsed = now;
+  }
+
+  /**
+   * Record a rate limit event for tracking.
+   */
+  recordRateLimit(account: ManagedAccount): void {
+    account.totalRateLimits++;
+    account.consecutiveSuccesses = 0;
+  }
+
+  /**
+   * Get the quota usage ratio for an account and model family.
+   * Returns a value between 0 (no usage) and 1 (high usage).
+   * Higher values indicate more quota has been consumed.
+   */
+  getQuotaUsageRatio(account: ManagedAccount, family: ModelFamily): number {
+    const now = Date.now();
+    const usage = account.quotaUsage[family];
+
+    if (!usage || now - usage.lastReset >= QUOTA_RESET_INTERVAL_MS) {
+      return 0; // Quota has reset
+    }
+
+    // Estimate quota usage based on requests made
+    // Typical quotas are 15-60 requests per minute depending on tier
+    const estimatedQuota = account.tier === "paid" ? 60 : 15;
+    return Math.min(1, usage.requests / estimatedQuota);
+  }
+
+  /**
+   * Smart account recommendation based on quota analysis.
+   * Returns the account with the lowest quota usage ratio.
+   * Implements the smart recommendation algorithm from Antigravity-Manager.
+   */
+  getRecommendedAccount(family: ModelFamily): ManagedAccount | null {
+    this.accounts.forEach(clearExpiredRateLimits);
+
+    const available = this.accounts.filter((a) => !isRateLimitedForFamily(a, family));
+    if (available.length === 0) {
+      return null;
+    }
+
+    // Separate by tier
+    const paidAccounts = available.filter((a) => a.tier === "paid");
+    const freeAccounts = available.filter((a) => a.tier !== "paid");
+
+    // Prioritize paid accounts first (Antigravity-Manager pattern: ULTRA > PRO > FREE)
+    const pool = paidAccounts.length > 0 ? paidAccounts : freeAccounts;
+
+    // Sort by quota usage ratio (lowest first = most quota remaining)
+    const sorted = pool.sort((a, b) => {
+      const ratioA = this.getQuotaUsageRatio(a, family);
+      const ratioB = this.getQuotaUsageRatio(b, family);
+      return ratioA - ratioB;
+    });
+
+    return sorted[0] ?? null;
+  }
+
+  /**
+   * Get account statistics for smart recommendation display.
+   * Returns info about each account's quota status.
+   */
+  getAccountStats(family: ModelFamily): Array<{
+    index: number;
+    email?: string;
+    tier?: AccountTier;
+    quotaUsageRatio: number;
+    isRateLimited: boolean;
+    consecutiveSuccesses: number;
+    totalRateLimits: number;
+  }> {
+    this.accounts.forEach(clearExpiredRateLimits);
+
+    return this.accounts.map((account) => ({
+      index: account.index,
+      email: account.email,
+      tier: account.tier,
+      quotaUsageRatio: this.getQuotaUsageRatio(account, family),
+      isRateLimited: isRateLimitedForFamily(account, family),
+      consecutiveSuccesses: account.consecutiveSuccesses,
+      totalRateLimits: account.totalRateLimits,
+    }));
+  }
+
+  /**
+   * Global rate limit synchronization - mark all model families as rate limited.
+   * Used when quota is exhausted (403 quota errors).
+   */
+  markGlobalRateLimited(account: ManagedAccount, retryAfterMs: number): void {
+    const families: ModelFamily[] = ["claude", "gemini-flash", "gemini-pro"];
+    for (const family of families) {
+      account.rateLimitResetTimes[family] = Date.now() + retryAfterMs;
+    }
   }
 }

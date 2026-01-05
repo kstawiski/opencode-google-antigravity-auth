@@ -22,14 +22,27 @@ interface RateLimitDelay {
   delayMs: number;
 }
 
+/**
+ * Adds ±20% random jitter to a delay value to prevent thundering herd.
+ * This helps distribute retry attempts across time when multiple clients
+ * are rate-limited simultaneously.
+ */
+export function addJitter(delayMs: number, jitterPercent: number = 0.2): number {
+  const jitterRange = delayMs * jitterPercent;
+  const jitter = (Math.random() * 2 - 1) * jitterRange; // Random value between -jitterRange and +jitterRange
+  return Math.max(0, Math.floor(delayMs + jitter));
+}
+
 export function computeExponentialBackoffMs(
   attempt: number,
   baseMs: number = RATE_LIMIT_BACKOFF_BASE_MS,
   maxMs: number = RATE_LIMIT_BACKOFF_MAX_MS,
+  withJitter: boolean = true,
 ): number {
   const safeAttempt = Math.max(1, Math.floor(attempt));
   const multiplier = 2 ** (safeAttempt - 1);
-  return Math.min(maxMs, Math.max(0, Math.floor(baseMs * multiplier)));
+  const backoff = Math.min(maxMs, Math.max(0, Math.floor(baseMs * multiplier)));
+  return withJitter ? addJitter(backoff) : backoff;
 }
 
 function toUrlStr(value: RequestInfo | URL): string {
@@ -309,12 +322,43 @@ interface AttemptInfo {
   requestedModel?: string;
 }
 
+/**
+ * Error types that trigger different handling strategies.
+ * Based on Antigravity-Manager patterns.
+ */
+export type ErrorType = "rate-limit" | "auth-expired" | "forbidden" | "server-error" | "network";
+
+/**
+ * Backoff strategies per error type (inspired by Antigravity-Manager).
+ * - auth-expired: Fixed short delay (token refresh usually quick)
+ * - forbidden: Fixed medium delay (may need account switch)
+ * - rate-limit: Exponential with jitter
+ * - server-error: Exponential with jitter, shorter max
+ * - network: Exponential with jitter
+ */
+export const ERROR_BACKOFF_CONFIG: Record<ErrorType, { baseMs: number; maxMs: number; fixed?: boolean }> = {
+  "auth-expired": { baseMs: 200, maxMs: 1000, fixed: true },
+  "forbidden": { baseMs: 500, maxMs: 5000, fixed: true },
+  "rate-limit": { baseMs: RATE_LIMIT_BACKOFF_BASE_MS, maxMs: RATE_LIMIT_BACKOFF_MAX_MS },
+  "server-error": { baseMs: 1000, maxMs: 30000 },
+  "network": { baseMs: 1000, maxMs: 60000 },
+};
+
+export function computeErrorBackoffMs(errorType: ErrorType, attempt: number): number {
+  const config = ERROR_BACKOFF_CONFIG[errorType];
+  if (config.fixed) {
+    return addJitter(config.baseMs);
+  }
+  return computeExponentialBackoffMs(attempt, config.baseMs, config.maxMs, true);
+}
+
 interface EndpointLoopResult {
-  type: "success" | "rate-limit" | "retry-soon" | "all-failed";
+  type: "success" | "rate-limit" | "retry-soon" | "all-failed" | "auth-error" | "forbidden-error";
   response?: Response;
   error?: Error;
   retryAfterMs?: number;
   attemptInfo?: AttemptInfo;
+  errorType?: ErrorType;
 }
 
 async function handleRateLimit(
@@ -422,6 +466,7 @@ async function handleRateLimit(
   }
 
   accountManager.markRateLimited(account, retryAfterMs, family);
+  accountManager.recordRateLimit(account);
 
   log.info(`Account ${account.index + 1}/${accountCount} rate-limited, switching...`, {
     fromAccountIndex: account.index,
@@ -435,6 +480,7 @@ async function handleRateLimit(
     errorMessage: bodyInfo.message ? bodyInfo.message.slice(0, 200) : undefined,
     attempt,
     reason: "rate-limit",
+    totalRateLimits: account.totalRateLimits,
   });
 
   try {
@@ -465,9 +511,9 @@ async function handleServerError(
   client: PluginContext["client"],
   family: ModelFamily,
 ): Promise<EndpointLoopResult> {
-  const retryAfterMs = 60000;
+  const retryAfterMs = computeErrorBackoffMs("server-error", 1);
 
-  // For 500 errors, we use a fixed short retry (1 min) rather than the heavy defaults
+  // For 500 errors, we use a fixed short retry rather than the heavy defaults
   accountManager.markRateLimited(account, retryAfterMs, family);
 
   log.warn(`Account ${account.index + 1}/${accountCount} received ${response.status} error on all endpoints`, {
@@ -496,7 +542,145 @@ async function handleServerError(
     });
   }
 
-  return { type: "rate-limit", retryAfterMs };
+  return { type: "rate-limit", retryAfterMs, errorType: "server-error" };
+}
+
+/**
+ * Handle 401 Unauthorized errors - authentication has expired or is invalid.
+ * This triggers an immediate account switch to try another account's credentials.
+ * Based on Antigravity-Manager's automatic rotation on auth failures.
+ */
+async function handleAuthError(
+  response: Response,
+  account: ReturnType<AccountManager["getCurrentOrNextForFamily"]> & {},
+  accountManager: AccountManager,
+  accountCount: number,
+  client: PluginContext["client"],
+  family: ModelFamily,
+): Promise<EndpointLoopResult> {
+  const retryAfterMs = computeErrorBackoffMs("auth-expired", 1);
+
+  // Mark account as rate-limited briefly to force switch
+  accountManager.markRateLimited(account, retryAfterMs, family);
+
+  // Also invalidate access token to force refresh on next attempt
+  account.access = undefined;
+  account.expires = undefined;
+
+  log.warn(`Account ${account.index + 1}/${accountCount} received 401 auth error`, {
+    fromAccountIndex: account.index,
+    fromAccountEmail: account.email,
+    accountCount,
+    status: response.status,
+    retryAfterMs,
+    reason: "auth-expired",
+  });
+
+  if (accountCount > 1) {
+    try {
+      await client.tui.showToast({
+        body: {
+          message: `Auth expired on ${account.email || `Account ${account.index + 1}`}. Switching...`,
+          variant: "warning",
+        },
+      });
+    } catch {}
+  } else {
+    try {
+      await client.tui.showToast({
+        body: {
+          message: `Auth expired. Refreshing token...`,
+          variant: "warning",
+        },
+      });
+    } catch {}
+  }
+
+  try {
+    await accountManager.save();
+  } catch (error) {
+    log.warn("Failed to save account state after auth error", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+
+  return { type: "auth-error", retryAfterMs, errorType: "auth-expired" };
+}
+
+/**
+ * Handle 403 Forbidden errors - account may be blocked or quota exhausted.
+ * This forces bypass of session locks and switches to next available account.
+ * Based on Antigravity-Manager's forced bypass pattern.
+ */
+async function handleForbiddenError(
+  response: Response,
+  account: ReturnType<AccountManager["getCurrentOrNextForFamily"]> & {},
+  accountManager: AccountManager,
+  accountCount: number,
+  client: PluginContext["client"],
+  family: ModelFamily,
+): Promise<EndpointLoopResult> {
+  // Check if this is a quota-related 403 by parsing the body
+  let isQuotaError = false;
+  try {
+    const text = await response.clone().text();
+    isQuotaError = text.toLowerCase().includes("quota") || text.toLowerCase().includes("limit");
+  } catch {}
+
+  // For quota errors, use longer backoff; for other 403s, use shorter
+  const retryAfterMs = isQuotaError
+    ? computeErrorBackoffMs("rate-limit", 1)
+    : computeErrorBackoffMs("forbidden", 1);
+
+  // Mark all model families as rate-limited for this account (global sync pattern)
+  // This implements "one endpoint throttled, all endpoints avoid" from Antigravity-Manager
+  if (isQuotaError) {
+    accountManager.markGlobalRateLimited(account, retryAfterMs);
+    accountManager.recordRateLimit(account);
+  } else {
+    accountManager.markRateLimited(account, retryAfterMs, family);
+  }
+
+  log.warn(`Account ${account.index + 1}/${accountCount} received 403 forbidden error`, {
+    fromAccountIndex: account.index,
+    fromAccountEmail: account.email,
+    accountCount,
+    status: response.status,
+    retryAfterMs,
+    isQuotaError,
+    reason: "forbidden",
+    globalSync: isQuotaError,
+  });
+
+  if (accountCount > 1) {
+    try {
+      await client.tui.showToast({
+        body: {
+          message: `Forbidden on ${account.email || `Account ${account.index + 1}`}${isQuotaError ? " (quota)" : ""}. Switching...`,
+          variant: "warning",
+        },
+      });
+    } catch {}
+  } else {
+    try {
+      await client.tui.showToast({
+        body: {
+          message: `Access forbidden${isQuotaError ? " (quota exhausted)" : ""}. Retrying in ${formatWaitTimeMs(retryAfterMs)}...`,
+          variant: "error",
+        },
+      });
+    } catch {}
+  }
+
+  try {
+    await accountManager.save();
+  } catch (error) {
+    log.warn("Failed to save account state after forbidden error", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+
+  return { type: "forbidden-error", retryAfterMs, errorType: "forbidden" };
 }
 
 async function tryEndpointFallbacks(
@@ -570,6 +754,17 @@ async function tryEndpointFallbacks(
           getRateLimitDelay,
           family,
         );
+      }
+
+      // Handle 401 Unauthorized - auth expired, force token refresh or account switch
+      if (response.status === 401) {
+        // Don't retry other endpoints for auth errors - switch account immediately
+        return handleAuthError(response, account, accountManager, accountCount, client, family);
+      }
+
+      // Handle 403 Forbidden after trying all endpoints
+      if (response.status === 403 && i === CODE_ASSIST_ENDPOINT_FALLBACKS.length - 1) {
+        return handleForbiddenError(response, account, accountManager, accountCount, client, family);
       }
 
       if (response.status >= 500 && i === CODE_ASSIST_ENDPOINT_FALLBACKS.length - 1) {
@@ -760,8 +955,33 @@ export function createAntigravityFetch(
         continue;
       }
 
+      // Handle auth errors - retry immediately with fresh token or different account
+      if (result.type === "auth-error") {
+        if (accountCount === 1) {
+          // For single account, brief delay then retry (token will be refreshed)
+          const waitMs = result.retryAfterMs || computeErrorBackoffMs("auth-expired", 1);
+          log.info("Single account auth error, refreshing token and retrying", { waitMs, family });
+          await sleep(waitMs, abortSignal);
+        }
+        // For multi-account, just continue to switch account immediately
+        continue;
+      }
+
+      // Handle forbidden errors - switch account or wait
+      if (result.type === "forbidden-error") {
+        if (accountCount === 1) {
+          const waitMs = result.retryAfterMs || computeErrorBackoffMs("forbidden", 1);
+          log.info("Single account forbidden error, waiting before retry", { waitMs, family });
+          await sleepWithBackoff(waitMs, abortSignal);
+        }
+        continue;
+      }
+
       if (result.type === "success" && result.response) {
         resetRateLimitState(account.index);
+
+        // Record successful request for quota tracking
+        accountManager.recordSuccess(account, family);
 
         try {
           await client.auth.set({

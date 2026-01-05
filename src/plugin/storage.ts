@@ -56,7 +56,23 @@ export interface AccountStorageV2 {
   activeIndex: number;
 }
 
+/**
+ * Quota usage tracking per model family.
+ * Tracks requests made within the current quota window.
+ */
+export interface QuotaUsage {
+  claude?: { requests: number; lastReset: number };
+  "gemini-flash"?: { requests: number; lastReset: number };
+  "gemini-pro"?: { requests: number; lastReset: number };
+}
+
+/**
+ * Default quota reset interval (1 minute for per-minute quotas).
+ */
+export const QUOTA_RESET_INTERVAL_MS = 60 * 1000;
+
 // V3: Split gemini into gemini-flash and gemini-pro, added tier
+// V4 compatible: Added quota tracking fields (backwards compatible)
 export interface AccountMetadata {
   email?: string;
   tier?: AccountTier;
@@ -67,6 +83,12 @@ export interface AccountMetadata {
   lastUsed: number;
   lastSwitchReason?: "rate-limit" | "initial" | "rotation";
   rateLimitResetTimes?: RateLimitState;
+  /** Quota usage tracking for smart account recommendation */
+  quotaUsage?: QuotaUsage;
+  /** Count of consecutive successful requests (resets on error) */
+  consecutiveSuccesses?: number;
+  /** Count of total rate limits encountered */
+  totalRateLimits?: number;
 }
 
 export interface AccountStorage {
