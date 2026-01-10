@@ -364,7 +364,7 @@ export const AntigravityOAuthPlugin = async ({ client }: PluginContext): Promise
 
             try {
               await saveAccounts({
-                version: 3,
+                version: 4,
                 accounts: accounts.map((acc, index) => ({
                   email: acc.email,
                   refreshToken: acc.refresh,
@@ -373,6 +373,11 @@ export const AntigravityOAuthPlugin = async ({ client }: PluginContext): Promise
                   managedProjectId: undefined,
                   addedAt: Date.now(),
                   lastUsed: index === 0 ? Date.now() : 0,
+                  health: {
+                    successCount: 0,
+                    failureCount: 0,
+                    consecutiveFailures: 0,
+                  },
                 })),
                 activeIndex: 0,
               });

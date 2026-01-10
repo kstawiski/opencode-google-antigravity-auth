@@ -1,8 +1,8 @@
 import type { PluginContext, GetAuth, ProjectContextResult } from "./types";
 import { CODE_ASSIST_ENDPOINT_FALLBACKS, ANTIGRAVITY_PROVIDER_ID } from "../constants";
 import { isOAuthAuth, accessTokenExpired, parseRefreshParts } from "./auth";
-import { AccountManager, type ModelFamily } from "./accounts";
-import { loadAccounts } from "./storage";
+import { AccountManager, type ModelFamily, type FailureReason } from "./accounts";
+import { loadAccounts, computeEscalatingBackoffMs } from "./storage";
 import { refreshAccessToken } from "./token";
 import { ensureProjectContext } from "./project";
 import { isGenerativeLanguageRequest, prepareAntigravityRequest, transformAntigravityResponse } from "./request";
@@ -77,6 +77,17 @@ function getModelFamilyFromUrl(urlString: string): ModelFamily {
     return "gemini-flash";
   }
   return "gemini-pro";
+}
+
+/**
+ * Helper to check if an account is rate-limited for a specific model family.
+ */
+function isAccountRateLimitedForFamily(
+  account: { rateLimitResetTimes: Record<string, number | undefined> },
+  family: ModelFamily
+): boolean {
+  const resetTime = account.rateLimitResetTimes[family as string];
+  return resetTime !== undefined && Date.now() < resetTime;
 }
 
 export function sleep(ms: number, signal?: AbortSignal | null): Promise<void> {
@@ -344,7 +355,7 @@ interface AttemptInfo {
 }
 
 interface EndpointLoopResult {
-  type: "success" | "rate-limit" | "retry-soon" | "all-failed";
+  type: "success" | "rate-limit" | "retry-soon" | "all-failed" | "switch-immediate";
   response?: Response;
   error?: Error;
   retryAfterMs?: number;
@@ -372,7 +383,7 @@ async function handleRateLimit(
   debugContext: ReturnType<typeof startAntigravityDebugRequest>,
   requestedModel: string | undefined,
   abortSignal: AbortSignal | undefined,
-  getRateLimitDelay: (accountIndex: number, serverRetryAfterMs: number | null) => RateLimitDelay,
+  getRateLimitDelay: (accountIndex: number, serverRetryAfterMs: number | null, accountManager?: AccountManager, family?: ModelFamily) => RateLimitDelay,
   family: ModelFamily,
 ): Promise<EndpointLoopResult> {
   const retryAfterHeaderMs = parseRetryAfterMs(response);
@@ -383,7 +394,8 @@ async function handleRateLimit(
     explicitServerRetryAfterMs ?? Math.min(getDefaultRetryAfterMs(bodyInfo.reason), RATE_LIMIT_SERVER_RETRY_MAX_MS);
   const serverRetryAfterMs = fallbackRetryAfterMs;
 
-  const { attempt, delayMs, serverRetryAfterMs: appliedServerRetryMs } = getRateLimitDelay(account.index, serverRetryAfterMs);
+  // Use escalating backoff based on consecutive failures
+  const { attempt, delayMs, serverRetryAfterMs: appliedServerRetryMs } = getRateLimitDelay(account.index, serverRetryAfterMs, accountManager, family);
   let retryAfterMs = Math.max(delayMs, RETRY_MIN_DELAY_MS);
 
   const retrySource =
@@ -443,10 +455,61 @@ async function handleRateLimit(
     return { type: "rate-limit", retryAfterMs };
   }
 
+  // Non-blocking account switching optimization (Antigravity-Manager style)
+  // For multi-account setups: immediately switch to next available account
+  // For single account: use escalating backoff
+
+  // Mark this account as rate-limited
+  accountManager.markRateLimited(account, retryAfterMs, family);
+
+  // Check if there are other available accounts for this family
+  const hasOtherAvailable = accountManager.getAccounts().some(
+    (a) => a.index !== account.index && !isAccountRateLimitedForFamily(a, family)
+  );
+
+  if (hasOtherAvailable) {
+    // Non-blocking switch: immediately try next account without waiting
+    log.info(`Account ${account.index + 1}/${accountCount} rate-limited, switching immediately to next available`, {
+      fromAccountIndex: account.index,
+      fromAccountEmail: account.email,
+      accountCount,
+      retryAfterMs,
+      retryAfterHeaderMs,
+      retryAfterBodyMs,
+      serverRetryAfterMs: appliedServerRetryMs,
+      retrySource,
+      errorMessage: bodyInfo.message ? bodyInfo.message.slice(0, 200) : undefined,
+      attempt,
+      reason: "rate-limit",
+      switchMode: "immediate",
+    });
+
+    try {
+      await client.tui.showToast({
+        body: {
+          message: `Rate limited on ${account.email || `Account ${account.index + 1}`}. Switching to next account...`,
+          variant: "warning",
+        },
+      });
+    } catch {}
+
+    try {
+      await accountManager.save();
+    } catch (error) {
+      log.warn("Failed to save rate limit state", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+
+    // Return switch-immediate to trigger immediate account switch without any delay
+    return { type: "switch-immediate" };
+  }
+
+  // Fall back to original behavior: if this is a brief rate limit, wait and retry
   const switchThresholdMs = 5000;
 
   if (retryAfterMs <= switchThresholdMs) {
-    log.info("Rate-limited briefly; retrying same account", {
+    log.info("Rate-limited briefly; retrying same account (no other accounts available)", {
       accountIndex: account.index,
       accountEmail: account.email,
       accountCount,
@@ -473,9 +536,7 @@ async function handleRateLimit(
     return { type: "retry-soon" };
   }
 
-  accountManager.markRateLimited(account, retryAfterMs, family);
-
-  log.info(`Account ${account.index + 1}/${accountCount} rate-limited, switching...`, {
+  log.info(`Account ${account.index + 1}/${accountCount} rate-limited, no other accounts available`, {
     fromAccountIndex: account.index,
     fromAccountEmail: account.email,
     accountCount,
@@ -492,7 +553,7 @@ async function handleRateLimit(
   try {
     await client.tui.showToast({
       body: {
-        message: `Rate limited on ${account.email || `Account ${account.index + 1}`} (retry in ${formatWaitTimeMs(retryAfterMs)}). Switching...`,
+        message: `Rate limited on ${account.email || `Account ${account.index + 1}`} (retry in ${formatWaitTimeMs(retryAfterMs)}). All accounts limited.`,
         variant: "warning",
       },
     });
@@ -558,7 +619,7 @@ async function tryEndpointFallbacks(
   accountCount: number,
   client: PluginContext["client"],
   abortSignal: AbortSignal | undefined,
-  getRateLimitDelay: (accountIndex: number, serverRetryAfterMs: number | null) => RateLimitDelay,
+  getRateLimitDelay: (accountIndex: number, serverRetryAfterMs: number | null, accountManager?: AccountManager, family?: ModelFamily) => RateLimitDelay,
   getServerErrorDelay: (family: ModelFamily, status: number) => { attempt: number; delayMs: number },
   family: ModelFamily,
 ): Promise<EndpointLoopResult> {
@@ -657,11 +718,30 @@ export function createAntigravityFetch(
   const rateLimitStateByAccount = new Map<number, { consecutive429: number; lastAt: number }>();
   const serverErrorStateByFamily = new Map<ModelFamily, { consecutive: number; lastAt: number }>();
 
-  const getRateLimitDelay = (accountIndex: number, serverRetryAfterMs: number | null): RateLimitDelay => {
+  /**
+   * Computes the rate limit delay using intelligent escalating backoff.
+   * Uses Antigravity-Manager style escalation for consecutive failures:
+   * 60s → 2m → 5m → 15m → 30m → 1h → 2h (max)
+   */
+  const getRateLimitDelay = (accountIndex: number, serverRetryAfterMs: number | null, accountManager?: AccountManager, family?: ModelFamily): RateLimitDelay => {
     const now = Date.now();
     const previous = rateLimitStateByAccount.get(accountIndex);
     const attempt = (previous?.consecutive429 ?? 0) + 1;
-    const backoffMs = computeExponentialBackoffMs(attempt);
+
+    // Use escalating backoff based on consecutive failures
+    let backoffMs: number;
+    if (accountManager && family) {
+      const account = accountManager.getAccounts().find(a => a.index === accountIndex);
+      if (account) {
+        backoffMs = accountManager.getEscalatingBackoffMs(account, family);
+      } else {
+        backoffMs = computeEscalatingBackoffMs(attempt);
+      }
+    } else {
+      backoffMs = computeEscalatingBackoffMs(attempt);
+    }
+
+    // Use the larger of server-specified delay or computed escalating backoff
     const delayMs = serverRetryAfterMs !== null ? Math.max(serverRetryAfterMs, backoffMs) : backoffMs;
 
     rateLimitStateByAccount.set(accountIndex, { consecutive429: attempt, lastAt: now });
@@ -836,6 +916,12 @@ export function createAntigravityFetch(
         continue;
       }
 
+      // Non-blocking immediate switch to next available account
+      if (result.type === "switch-immediate") {
+        log.info("Immediate account switch triggered, trying next available account", { family });
+        continue;
+      }
+
       if (result.type === "rate-limit") {
         if (accountCount === 1) {
           const waitMs = result.retryAfterMs || accountManager.getMinWaitTimeForFamily(family) || 1000;
@@ -848,6 +934,9 @@ export function createAntigravityFetch(
       if (result.type === "success" && result.response) {
         resetRateLimitState(account.index);
         resetServerErrorState(family);
+
+        // Record successful request for health tracking
+        accountManager.recordSuccess(account, family);
 
         await persistAccountState();
 
@@ -867,6 +956,10 @@ export function createAntigravityFetch(
       }
 
       if (result.type === "all-failed") {
+        // Record failure for health tracking
+        accountManager.recordFailure(account, "server-error", family);
+        await persistAccountState();
+
         if (result.response && result.attemptInfo) {
           const debugContext = startAntigravityDebugRequest({
             originalUrl: toUrlStr(input),

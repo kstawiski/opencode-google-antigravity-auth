@@ -1,7 +1,7 @@
 import { describe, it, expect, mock, beforeEach } from "bun:test";
 import { join } from "node:path";
 import { promises as fs } from "node:fs";
-import { loadAccounts, saveAccounts, getStoragePath, resetAccountsCache, type AccountStorageV1, type AccountStorageV2, type AccountStorage } from "./storage";
+import { loadAccounts, saveAccounts, getStoragePath, resetAccountsCache, type AccountStorageV1, type AccountStorageV2, type AccountStorageV3, type AccountStorage } from "./storage";
 
 // Mock filesystem
 const mockFs = {
@@ -66,7 +66,7 @@ describe("storage migration", () => {
     const storage = await loadAccounts();
 
     expect(storage).not.toBeNull();
-    expect(storage?.version).toBe(3);
+    expect(storage?.version).toBe(4);
     expect(storage?.accounts[0]?.rateLimitResetTimes).toEqual({
       claude: futureTime,
       "gemini-flash": futureTime,
@@ -77,7 +77,7 @@ describe("storage migration", () => {
     // Verify it saved the migrated data
     expect(mockFs.writeFile).toHaveBeenCalled();
     const savedContent = JSON.parse(mockFs.writeFile.mock.calls[0]?.[1] as string);
-    expect(savedContent.version).toBe(3);
+    expect(savedContent.version).toBe(4);
   });
 
   it("should preserve expired rate limits during v1 migration", async () => {
@@ -102,7 +102,7 @@ describe("storage migration", () => {
     const storage = await loadAccounts();
 
     expect(storage).not.toBeNull();
-    expect(storage?.version).toBe(3);
+    expect(storage?.version).toBe(4);
     expect(storage?.accounts[0]?.rateLimitResetTimes).toEqual({
       claude: pastTime,
       "gemini-flash": pastTime,
@@ -135,7 +135,7 @@ describe("storage migration", () => {
     const storage = await loadAccounts();
 
     expect(storage).not.toBeNull();
-    expect(storage?.version).toBe(3);
+    expect(storage?.version).toBe(4);
     expect(storage?.accounts[0]?.rateLimitResetTimes).toEqual({
       claude: futureTime,
       "gemini-flash": futureTime,
@@ -146,7 +146,7 @@ describe("storage migration", () => {
     // Verify it saved the migrated data
     expect(mockFs.writeFile).toHaveBeenCalled();
     const savedContent = JSON.parse(mockFs.writeFile.mock.calls[0]?.[1] as string);
-    expect(savedContent.version).toBe(3);
+    expect(savedContent.version).toBe(4);
   });
 
   it("should preserve expired rate limits during v2 migration", async () => {
@@ -169,16 +169,16 @@ describe("storage migration", () => {
     const storage = await loadAccounts();
 
     expect(storage).not.toBeNull();
-    expect(storage?.version).toBe(3);
+    expect(storage?.version).toBe(4);
     expect(storage?.accounts[0]?.rateLimitResetTimes).toEqual({
       "gemini-flash": pastTime,
       "gemini-pro": pastTime,
     });
   });
 
-  it("should load v3 storage directly", async () => {
+  it("should migrate v3 storage to v4", async () => {
     const futureTime = Date.now() + 60000;
-    const v3Data: AccountStorage = {
+    const v3Data: AccountStorageV3 = {
       version: 3,
       activeIndex: 1,
       accounts: [
@@ -200,13 +200,16 @@ describe("storage migration", () => {
 
     const storage = await loadAccounts();
 
-    expect(storage).toEqual(v3Data);
-    expect(mockFs.writeFile).not.toHaveBeenCalled();
+    // Should migrate to v4
+    expect(storage?.version).toBe(4);
+    expect(storage?.accounts[0]?.health).toBeDefined();
+    expect(storage?.accounts[0]?.health?.successCount).toBe(0);
+    expect(mockFs.writeFile).toHaveBeenCalled();
   });
 
-  it("should preserve tier field in v3 storage", async () => {
+  it("should preserve tier field when migrating v3 to v4", async () => {
     const now = Date.now();
-    const v3Data: AccountStorage = {
+    const v3Data: AccountStorageV3 = {
       version: 3,
       activeIndex: 0,
       accounts: [
@@ -238,10 +241,12 @@ describe("storage migration", () => {
     const storage = await loadAccounts();
 
     expect(storage).not.toBeNull();
+    expect(storage?.version).toBe(4);
     expect(storage?.accounts[0]?.tier).toBe("paid");
     expect(storage?.accounts[1]?.tier).toBe("free");
     expect(storage?.accounts[2]?.tier).toBeUndefined();
-    expect(mockFs.writeFile).not.toHaveBeenCalled();
+    // Migration should write the file
+    expect(mockFs.writeFile).toHaveBeenCalled();
   });
 
   it("should handle missing file (ENOENT)", async () => {
